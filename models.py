@@ -41,7 +41,10 @@ class ModelWrapper:
         self.vllm_engine = None
         self.processor = None
         self.latent_space_realign = bool(getattr(args, "latent_space_realign", False)) if args else False
+        self.latent_align_mode = str(getattr(args, "latent_align_mode", "linear")) if args else "linear"
+        self.latent_align_softmax_temperature = float(getattr(args, "latent_align_softmax_temperature", 1.0)) if args else 1.0
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._latent_softmax_weights: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.args = args
 
         if self.model_backend == "vlm" and use_vllm:
@@ -286,7 +289,48 @@ class ModelWrapper:
 
         return matrix, target_norm
 
+    def _ensure_latent_softmax_weights(self, model, device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = id(model)
+        target_device = torch.device(device)
+        info = self._latent_softmax_weights.get(key)
+        if info is not None:
+            W_out, W_in, target_norm = info
+            if W_out.device != target_device:
+                W_out = W_out.to(target_device)
+                W_in = W_in.to(target_device)
+                target_norm = target_norm.to(target_device)
+                self._latent_softmax_weights[key] = (W_out, W_in, target_norm)
+            return W_out, W_in, target_norm
+
+        input_embeds = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        if output_embeds is None:
+            output_embeds = getattr(model, "lm_head", None)
+        if (
+            input_embeds is None or output_embeds is None
+            or not hasattr(input_embeds, "weight") or not hasattr(output_embeds, "weight")
+        ):
+            raise RuntimeError("Cannot access embedding weights for softmax latent alignment.")
+        W_in = input_embeds.weight.detach().to(device=target_device, dtype=torch.float32)
+        W_out = output_embeds.weight.detach().to(device=target_device, dtype=torch.float32)
+        target_norm = W_in.norm(dim=1).mean().detach()
+        self._latent_softmax_weights[key] = (W_out, W_in, target_norm)
+        return W_out, W_in, target_norm
+
     def _apply_latent_realignment(self, hidden: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
+        if self.latent_align_mode == "softmax":
+            W_out, W_in, target_norm = self._ensure_latent_softmax_weights(model, hidden.device)
+            hidden_fp32 = hidden.to(torch.float32)
+            T = max(self.latent_align_softmax_temperature, 1e-4)
+            logits = torch.matmul(hidden_fp32, W_out.T) / T
+            probs = torch.softmax(logits, dim=-1)
+            aligned = torch.matmul(probs, W_in)
+            pre_aligned = aligned.detach().clone()
+            self.pre_aligned = pre_aligned
+            aligned_norm = aligned.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            aligned = aligned * (target_norm / aligned_norm)
+            return aligned.to(hidden.dtype)
+
         matrix, target_norm = self._ensure_latent_realign_matrix(model, hidden.device, self.args)
         hidden_fp32 = hidden.to(torch.float32)
         aligned = torch.matmul(hidden_fp32, matrix)

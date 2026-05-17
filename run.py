@@ -108,6 +108,19 @@ def main():
     parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
+    parser.add_argument(
+        "--latent_align_mode",
+        type=str,
+        default="linear",
+        choices=["linear", "softmax"],
+        help="latent alignment mode: 'linear' (regression W_out->W_in) or 'softmax' (softmax(h W_out^T / T) @ W_in)",
+    )
+    parser.add_argument(
+        "--latent_align_softmax_temperature",
+        type=float,
+        default=1.0,
+        help="temperature for softmax latent alignment mode",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support
